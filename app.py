@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
@@ -28,7 +29,7 @@ app = FastAPI(title="EEG Anxiety Detection API")
 # -------------------------
 origins = [
     "http://localhost:9002",              # local dev
-    "https://anxiocheck-ypipu.web.app",  # Firebase frontend
+    "https://anxiocheck-ypipu.web.app",   # Firebase frontend
 ]
 
 app.add_middleware(
@@ -49,17 +50,15 @@ async def root():
 # -------------------------
 # Prediction logic
 # -------------------------
-def predict_from_bytes(file_bytes: bytes, filename: str):
-    temp_path = os.path.join(ROOT, "temp_input.mat")
-    with open(temp_path, "wb") as f:
-        f.write(file_bytes)
-
-    feats = extract_features(temp_path)
-    os.remove(temp_path)
+def predict_from_bytes(file_bytes: bytes):
+    # Use BytesIO instead of writing to disk
+    file_like = io.BytesIO(file_bytes)
+    feats = extract_features(file_like)
 
     if feats is None or getattr(feats, "ndim", 0) != 1:
         raise RuntimeError("Invalid features extracted")
 
+    # Feature selection + prediction
     Xsel = selector.transform(np.asarray(feats, float).reshape(1, -1))
     probs = ensemble.predict_proba(Xsel)[0]
     idx = int(np.argmax(probs))
@@ -71,8 +70,8 @@ def predict_from_bytes(file_bytes: bytes, filename: str):
         "label": label,
         "confidence": round(float(probs[idx]) * 100, 2),
         "probabilities": {
-            labels.get("0","0"): round(float(probs[0]) * 100, 2),
-            labels.get("1","1"): round(float(probs[1]) * 100, 2),
+            labels.get("0", "0"): round(float(probs[0]) * 100, 2),
+            labels.get("1", "1"): round(float(probs[1]) * 100, 2),
         },
     }
 
@@ -82,5 +81,5 @@ def predict_from_bytes(file_bytes: bytes, filename: str):
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
-    result = predict_from_bytes(contents, file.filename)
+    result = predict_from_bytes(contents)
     return result
