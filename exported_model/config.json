@@ -1,0 +1,16 @@
+{
+  "classifier": "RandomForestEnsemble",
+  "n_estimators_list": [
+    450,
+    500,
+    350
+  ],
+  "cv_splits": 4,
+  "top_k": 300,
+  "feature_dim_before": 25676,
+  "feature_dim_after": 300,
+  "labels": {
+    "0": "not_anxious",
+    "1": "anxious"
+  }
+}
