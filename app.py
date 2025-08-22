@@ -1,4 +1,5 @@
-import os, json
+import os
+import json
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from joblib import load
@@ -17,6 +18,16 @@ ensemble = load(os.path.join(MODEL_DIR, "ensemble_model.joblib"))
 
 app = FastAPI(title="EEG Anxiety Detection API")
 
+# -------------------------
+# Root endpoint
+# -------------------------
+@app.get("/")
+async def root():
+    return {"message": "EEG Anxiety Detection API is live!"}
+
+# -------------------------
+# Prediction logic
+# -------------------------
 def predict_from_bytes(file_bytes: bytes, filename: str):
     # Save temp file because extract_features expects a path
     temp_path = os.path.join(ROOT, "temp_input.mat")
@@ -45,6 +56,9 @@ def predict_from_bytes(file_bytes: bytes, filename: str):
         },
     }
 
+# -------------------------
+# Predict endpoint
+# -------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = await file.read()
