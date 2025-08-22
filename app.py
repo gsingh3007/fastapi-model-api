@@ -2,21 +2,42 @@ import os
 import json
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
 from modma_eeg import extract_features
 
-# Paths
+# -------------------------
+# Paths and model loading
+# -------------------------
 ROOT = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(ROOT, "exported_model")
 
-# Load config + artifacts once at startup
 with open(os.path.join(MODEL_DIR, "config.json"), "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 selector = load(os.path.join(MODEL_DIR, "selector.joblib"))
 ensemble = load(os.path.join(MODEL_DIR, "ensemble_model.joblib"))
 
+# -------------------------
+# FastAPI app
+# -------------------------
 app = FastAPI(title="EEG Anxiety Detection API")
+
+# -------------------------
+# CORS middleware
+# -------------------------
+origins = [
+    "http://localhost:9002",              # local dev
+    "https://anxiocheck-ypipu.web.app",  # Firebase frontend
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -------------------------
 # Root endpoint
@@ -29,7 +50,6 @@ async def root():
 # Prediction logic
 # -------------------------
 def predict_from_bytes(file_bytes: bytes, filename: str):
-    # Save temp file because extract_features expects a path
     temp_path = os.path.join(ROOT, "temp_input.mat")
     with open(temp_path, "wb") as f:
         f.write(file_bytes)
