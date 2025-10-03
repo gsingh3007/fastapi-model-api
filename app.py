@@ -1,5 +1,4 @@
 import os
-import io
 import gc
 import json
 import numpy as np
@@ -11,33 +10,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
 from modma_eeg import extract_features
 import psutil
+import logging
 
-# -------------------------
-# Paths & config
-# -------------------------
+# ------------------------- Logging -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+def log_memory(stage=""):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / 1024 / 1024  # MB
+    logger.info(f"[MEMORY] {stage}: {mem:.2f} MB")
+
+# ------------------------- Paths & Config -------------------------
 ROOT = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(ROOT, "exported_model")
 
 with open(os.path.join(MODEL_DIR, "config.json"), "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-# -------------------------
-# Memory logger
-# -------------------------
-def log_memory(stage=""):
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / 1024 / 1024  # MB
-    print(f"[MEMORY] {stage}: {mem:.2f} MB")
-
-# -------------------------
-# FastAPI app
-# -------------------------
+# ------------------------- FastAPI app -------------------------
 app = FastAPI(title="EEG Anxiety Detection API")
 
 # CORS
 origins = [
-    "http://localhost:9002",              # local dev
-    "https://anxiocheck-ypipu.web.app",  # Firebase frontend
+    "http://localhost:9002",             # local dev
+    "https://anxiocheck-ypipu.web.app", # Firebase frontend
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -47,9 +47,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------
-# Lazy, memory-mapped model loading
-# -------------------------
+# ------------------------- Lazy, memory-mapped model loading -------------------------
 def _pick_existing(*candidates: str) -> str:
     for p in candidates:
         fp = os.path.join(MODEL_DIR, p)
@@ -68,9 +66,7 @@ def get_models():
     log_memory("After loading models")
     return selector, ensemble
 
-# -------------------------
-# Root / health
-# -------------------------
+# ------------------------- Root / Health -------------------------
 @app.get("/")
 async def root():
     return {"message": "EEG Anxiety Detection API is live!"}
@@ -84,33 +80,37 @@ async def health():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------------
-# Prediction logic
-# -------------------------
+# ------------------------- Prediction Logic -------------------------
 def predict_from_bytes(file_bytes: bytes):
     tmp_path = None
     try:
-        # Save uploaded file temporarily
+        # Save temporary file for feature extraction
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
             tmp_path = tmp.name
 
-        log_memory("Before feature extraction")
-        # Extract features in float32 to save memory
+        log_memory("After file upload / temp file created")
+        
+        # Feature extraction
         feats = extract_features(tmp_path)
-        if feats is not None:
-            feats = np.asarray(feats, dtype=np.float32)
         log_memory("After feature extraction")
 
         if feats is None or getattr(feats, "ndim", 0) != 1:
             raise RuntimeError("Invalid features extracted")
 
+        # Convert features to float32 to save memory
+        feats = np.asarray(feats, dtype=np.float32)
+        log_memory("After converting features to float32")
+
+        # Load models
         selector, ensemble = get_models()
 
-        Xsel = selector.transform(feats.reshape(1, -1).astype(np.float32))
+        # Transform features
+        Xsel = selector.transform(feats.reshape(1, -1))
         log_memory("After selector transform")
 
+        # Predict
         probs = ensemble.predict_proba(Xsel)[0]
         log_memory("After prediction")
 
@@ -127,7 +127,7 @@ def predict_from_bytes(file_bytes: bytes):
             },
         }
     finally:
-        # Cleanup temp file and free memory aggressively
+        # Aggressive cleanup
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -135,15 +135,15 @@ def predict_from_bytes(file_bytes: bytes):
                 pass
         del feats, Xsel, probs
         gc.collect()
+        log_memory("After cleanup")
 
-# -------------------------
-# Predict endpoint
-# -------------------------
+# ------------------------- Predict Endpoint -------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    contents = None
     try:
         contents = await file.read()
-        log_memory("After file upload")
+        log_memory("After file read")
         result = predict_from_bytes(contents)
         return result
     except HTTPException:
@@ -151,5 +151,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
     finally:
-        del contents
+        if contents is not None:
+            del contents
         gc.collect()
+        log_memory("After request cleanup")
