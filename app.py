@@ -10,6 +10,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
 from modma_eeg import extract_features
+import psutil
 
 # -------------------------
 # Paths & config
@@ -19,6 +20,14 @@ MODEL_DIR = os.path.join(ROOT, "exported_model")
 
 with open(os.path.join(MODEL_DIR, "config.json"), "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
+
+# -------------------------
+# Memory logger
+# -------------------------
+def log_memory(stage=""):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / 1024 / 1024  # in MB
+    print(f"[MEMORY] {stage}: {mem:.2f} MB")
 
 # -------------------------
 # FastAPI app
@@ -40,7 +49,6 @@ app.add_middleware(
 
 # -------------------------
 # Lazy, memory-mapped model loading
-# (Loads once, keeps arrays memory-mapped from disk)
 # -------------------------
 def _pick_existing(*candidates: str) -> str:
     for p in candidates:
@@ -51,13 +59,13 @@ def _pick_existing(*candidates: str) -> str:
 
 @lru_cache(maxsize=1)
 def get_models():
-    # Prefer compressed artifacts if present (you can create them offline with joblib.dump(..., compress=3))
     selector_path = _pick_existing("selector_compressed.joblib", "selector.joblib")
     ensemble_path = _pick_existing("ensemble_model_compressed.joblib", "ensemble_model.joblib")
 
-    # mmap_mode='r' keeps large numpy arrays on disk instead of copying into RAM
     selector = load(selector_path, mmap_mode="r")
     ensemble = load(ensemble_path, mmap_mode="r")
+
+    log_memory("After loading models")
     return selector, ensemble
 
 # -------------------------
@@ -71,6 +79,7 @@ async def root():
 async def health():
     try:
         get_models()
+        log_memory("Health check")
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -79,8 +88,6 @@ async def health():
 # Prediction logic
 # -------------------------
 def predict_from_bytes(file_bytes: bytes):
-    # If your extract_features requires a file path, write a temp file, then remove it ASAP.
-    # Using delete=False + finally to ensure cleanup on Windows too.
     tmp_path = None
     try:
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
@@ -88,18 +95,22 @@ def predict_from_bytes(file_bytes: bytes):
             tmp.flush()
             tmp_path = tmp.name
 
+        log_memory("Before feature extraction")
         feats = extract_features(tmp_path)
+        log_memory("After feature extraction")
 
         if feats is None or getattr(feats, "ndim", 0) != 1:
             raise RuntimeError("Invalid features extracted")
 
         selector, ensemble = get_models()
 
-        # NOTE: keeping dtype default (user asked for 1,2,3,5; downcasting is step 4)
         Xsel = selector.transform(np.asarray(feats, dtype=np.float64).reshape(1, -1))
-        probs = ensemble.predict_proba(Xsel)[0]
-        idx = int(np.argmax(probs))
+        log_memory("After selector transform")
 
+        probs = ensemble.predict_proba(Xsel)[0]
+        log_memory("After prediction")
+
+        idx = int(np.argmax(probs))
         labels = CONFIG.get("labels", {"0": "not_anxious", "1": "anxious"})
         label = labels.get(str(idx), str(idx))
 
@@ -112,13 +123,11 @@ def predict_from_bytes(file_bytes: bytes):
             },
         }
     finally:
-        # Aggressive cleanup
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-        # Help the 512MB instance by freeing intermediates promptly
         gc.collect()
 
 # -------------------------
@@ -128,14 +137,13 @@ def predict_from_bytes(file_bytes: bytes):
 async def predict(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        log_memory("After file upload")
         result = predict_from_bytes(contents)
         return result
     except HTTPException:
         raise
     except Exception as e:
-        # Avoid exposing internals to client; logs on host will have full trace
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
     finally:
-        # Ensure the uploaded buffer can be GC'd
         del contents
         gc.collect()
