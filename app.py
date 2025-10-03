@@ -5,13 +5,12 @@ import json
 import numpy as np
 from functools import lru_cache
 from tempfile import NamedTemporaryFile
-import logging
-import psutil
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
 from modma_eeg import extract_features
+import psutil
 
 # -------------------------
 # Paths & config
@@ -23,32 +22,23 @@ with open(os.path.join(MODEL_DIR, "config.json"), "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 # -------------------------
-# Logging setup
+# Memory logger
 # -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
 def log_memory(stage=""):
-    """Logs current memory usage in MB"""
     process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / 1024 / 1024
-    logging.info(f"[MEMORY] {stage}: {mem:.2f} MB")
+    mem = process.memory_info().rss / 1024 / 1024  # MB
+    print(f"[MEMORY] {stage}: {mem:.2f} MB")
 
 # -------------------------
 # FastAPI app
 # -------------------------
 app = FastAPI(title="EEG Anxiety Detection API")
 
-# -------------------------
-# CORS middleware
-# -------------------------
+# CORS
 origins = [
-    "http://localhost:9002",               # local dev
-    "https://anxiocheck-ypipu.web.app",   # Firebase frontend
+    "http://localhost:9002",              # local dev
+    "https://anxiocheck-ypipu.web.app",  # Firebase frontend
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -69,7 +59,6 @@ def _pick_existing(*candidates: str) -> str:
 
 @lru_cache(maxsize=1)
 def get_models():
-    """Load models lazily with memory-mapped arrays."""
     selector_path = _pick_existing("selector_compressed.joblib", "selector.joblib")
     ensemble_path = _pick_existing("ensemble_model_compressed.joblib", "ensemble_model.joblib")
 
@@ -80,7 +69,7 @@ def get_models():
     return selector, ensemble
 
 # -------------------------
-# Root / health endpoints
+# Root / health
 # -------------------------
 @app.get("/")
 async def root():
@@ -101,14 +90,17 @@ async def health():
 def predict_from_bytes(file_bytes: bytes):
     tmp_path = None
     try:
-        # Save uploaded bytes to a temporary file
+        # Save uploaded file temporarily
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
             tmp_path = tmp.name
 
         log_memory("Before feature extraction")
+        # Extract features in float32 to save memory
         feats = extract_features(tmp_path)
+        if feats is not None:
+            feats = np.asarray(feats, dtype=np.float32)
         log_memory("After feature extraction")
 
         if feats is None or getattr(feats, "ndim", 0) != 1:
@@ -116,11 +108,9 @@ def predict_from_bytes(file_bytes: bytes):
 
         selector, ensemble = get_models()
 
-        # Transform features
-        Xsel = selector.transform(np.asarray(feats, dtype=np.float64).reshape(1, -1))
+        Xsel = selector.transform(feats.reshape(1, -1).astype(np.float32))
         log_memory("After selector transform")
 
-        # Make prediction
         probs = ensemble.predict_proba(Xsel)[0]
         log_memory("After prediction")
 
@@ -136,14 +126,14 @@ def predict_from_bytes(file_bytes: bytes):
                 labels.get("1", "1"): round(float(probs[1]) * 100, 2),
             },
         }
-
     finally:
-        # Aggressive cleanup
+        # Cleanup temp file and free memory aggressively
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
+        del feats, Xsel, probs
         gc.collect()
 
 # -------------------------
@@ -151,7 +141,6 @@ def predict_from_bytes(file_bytes: bytes):
 # -------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    contents = None
     try:
         contents = await file.read()
         log_memory("After file upload")
@@ -160,9 +149,7 @@ async def predict(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception("Inference failed")
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
     finally:
-        if contents:
-            del contents
+        del contents
         gc.collect()
