@@ -12,33 +12,61 @@ from modma_eeg import extract_features
 import psutil
 import logging
 
-# ------------------------- Logging -------------------------
+
+# -------------------------------------------------------------
+#                    LOGGING + MEMORY DEBUG
+# -------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("anxiocheck-api")
+
 
 def log_memory(stage=""):
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info().rss / 1024 / 1024  # MB
-    logger.info(f"[MEMORY] {stage}: {mem:.2f} MB")
+    """Utility to monitor memory usage at key steps."""
+    try:
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info().rss / 1024 / 1024
+        logger.info(f"[MEMORY] {stage}: {mem:.2f} MB")
+    except Exception:
+        pass
 
-# ------------------------- Paths & Config -------------------------
+
+# -------------------------------------------------------------
+#                    PATHS & MODEL CONFIG
+# -------------------------------------------------------------
 ROOT = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(ROOT, "exported_model")
 
+# Load labels & metadata
 with open(os.path.join(MODEL_DIR, "config.json"), "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
-# ------------------------- FastAPI app -------------------------
+
+# -------------------------------------------------------------
+#                     FASTAPI APP + CORS
+# -------------------------------------------------------------
 app = FastAPI(title="EEG Anxiety Detection API")
 
-# CORS
 origins = [
-    "http://localhost:9002",             # local dev
-    "https://anxiocheck-ypipu.web.app", # Firebase frontend
+    "http://localhost:9002",
+    "http://localhost:3000",
+    "http://127.0.0.1:9002",
+    "http://127.0.0.1:3000",
+
+    # Firebase Hosting (production)
+    "https://anxiocheck-ypipu.web.app",
+    "https://anxiocheck-ypipu.firebaseapp.com",
+
+    # Firebase preview URLs
+    "https://*.web.app",
+    "https://*.firebaseapp.com",
+
+    # Firebase Studio editor
+    "https://studio.firebase.google.com",
 ]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -47,72 +75,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------- Lazy, memory-mapped model loading -------------------------
+
+# -------------------------------------------------------------
+#               MEMORY-MAPPED MODEL LOADING (LAZY)
+# -------------------------------------------------------------
 def _pick_existing(*candidates: str) -> str:
-    for p in candidates:
-        fp = os.path.join(MODEL_DIR, p)
+    """Returns the first filename that exists inside MODEL_DIR."""
+    for name in candidates:
+        fp = os.path.join(MODEL_DIR, name)
         if os.path.exists(fp):
             return fp
-    raise FileNotFoundError(f"None of the model files exist: {candidates}")
+    raise FileNotFoundError(f"Missing model files: {candidates}")
+
 
 @lru_cache(maxsize=1)
 def get_models():
+    """Load selector + ensemble model once (cached + memory-mapped)."""
     selector_path = _pick_existing("selector_compressed.joblib", "selector.joblib")
-    ensemble_path = _pick_existing("ensemble_model_compressed.joblib", "ensemble_model.joblib")
+    ensemble_path = _pick_existing("ensemble_model_compressed.joblib",
+                                   "ensemble_model.joblib")
 
     selector = load(selector_path, mmap_mode="r")
     ensemble = load(ensemble_path, mmap_mode="r")
 
-    log_memory("After loading models")
+    log_memory("Models loaded (selector + ensemble)")
     return selector, ensemble
 
-# ------------------------- Root / Health -------------------------
+
+# -------------------------------------------------------------
+#                 BASIC ROOT + HEALTH ENDPOINTS
+# -------------------------------------------------------------
 @app.get("/")
 async def root():
     return {"message": "EEG Anxiety Detection API is live!"}
+
 
 @app.get("/health")
 async def health():
     try:
         get_models()
-        log_memory("Health check")
+        log_memory("HealthCheck OK")
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ------------------------- Prediction Logic -------------------------
+
+# -------------------------------------------------------------
+#                        PREDICTION CORE
+# -------------------------------------------------------------
 def predict_from_bytes(file_bytes: bytes):
     tmp_path = None
+    feats = None
+    Xsel = None
+    probs = None
+
     try:
-        # Save temporary file for feature extraction
+        # 1. Save temp file
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
             tmp.write(file_bytes)
             tmp.flush()
             tmp_path = tmp.name
 
-        log_memory("After file upload / temp file created")
-        
-        # Feature extraction
+        log_memory("File saved for extraction")
+
+        # 2. Extract features
         feats = extract_features(tmp_path)
-        log_memory("After feature extraction")
+        log_memory("Features extracted")
 
         if feats is None or getattr(feats, "ndim", 0) != 1:
             raise RuntimeError("Invalid features extracted")
 
-        # Convert features to float32 to save memory
-        feats = np.asarray(feats, dtype=np.float32)
-        log_memory("After converting features to float32")
+        # Convert to float32 to reduce RAM footprint
+        feats = np.asarray(feats, dtype=np.float32).reshape(1, -1)
+        log_memory("Converted to float32")
 
-        # Load models
+        # 3. Load models
         selector, ensemble = get_models()
 
-        # Transform features
-        Xsel = selector.transform(feats.reshape(1, -1))
-        log_memory("After selector transform")
+        # 4. Transform
+        Xsel = selector.transform(feats)
+        log_memory("Selector transform done")
 
-        # Predict
+        # 5. Predict
         probs = ensemble.predict_proba(Xsel)[0]
-        log_memory("After prediction")
+        log_memory("Prediction done")
 
         idx = int(np.argmax(probs))
         labels = CONFIG.get("labels", {"0": "not_anxious", "1": "anxious"})
@@ -126,32 +172,40 @@ def predict_from_bytes(file_bytes: bytes):
                 labels.get("1", "1"): round(float(probs[1]) * 100, 2),
             },
         }
+
     finally:
-        # Aggressive cleanup
-        if tmp_path and os.path.exists(tmp_path):
-            try:
+        # Cleanup temporary file
+        try:
+            if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+        # Cleanup arrays
         del feats, Xsel, probs
         gc.collect()
-        log_memory("After cleanup")
+        log_memory("Cleanup complete")
 
-# ------------------------- Predict Endpoint -------------------------
+
+# -------------------------------------------------------------
+#                     PREDICT ENDPOINT
+# -------------------------------------------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     contents = None
     try:
         contents = await file.read()
-        log_memory("After file read")
-        result = predict_from_bytes(contents)
-        return result
+        log_memory("File received")
+        return predict_from_bytes(contents)
+
     except HTTPException:
         raise
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+
     finally:
         if contents is not None:
             del contents
         gc.collect()
-        log_memory("After request cleanup")
+        log_memory("Request cleanup done")
