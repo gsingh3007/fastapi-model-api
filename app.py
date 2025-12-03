@@ -2,7 +2,6 @@ import os
 import gc
 import json
 import numpy as np
-from functools import lru_cache
 from tempfile import NamedTemporaryFile
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -13,27 +12,25 @@ import psutil
 import logging
 
 # ---------------------------------------------------------
-# Logging setup
+# Logging
 # ---------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("anxiocheck-api")
 
 
 def log_memory(stage=""):
-    """Utility to monitor memory usage at key steps."""
     try:
-        process = psutil.Process(os.getpid())
-        mem = process.memory_info().rss / 1024 / 1024
+        mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
         logger.info(f"[MEMORY] {stage}: {mem:.2f} MB")
     except:
         pass
 
 
 # ---------------------------------------------------------
-# Paths
+# Paths & Config
 # ---------------------------------------------------------
 ROOT = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(ROOT, "exported_model")
@@ -41,9 +38,15 @@ MODEL_DIR = os.path.join(ROOT, "exported_model")
 with open(os.path.join(MODEL_DIR, "config.json"), "r") as f:
     CONFIG = json.load(f)
 
+SELECTOR_PATH = os.path.join(MODEL_DIR, "selector.joblib")
+ENSEMBLE_PATH = os.path.join(MODEL_DIR, "ensemble_model.joblib")
+
+selector = None
+ensemble = None
+
 
 # ---------------------------------------------------------
-# FastAPI + CORS
+# FastAPI App + CORS
 # ---------------------------------------------------------
 app = FastAPI(title="EEG Anxiety Detection API")
 
@@ -63,63 +66,51 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-# Load models (lazy, cached, memory-mapped)
+# Load Models ONCE at startup
 # ---------------------------------------------------------
-def _pick_existing(*names):
-    for n in names:
-        p = os.path.join(MODEL_DIR, n)
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError("Model files missing.")
+@app.on_event("startup")
+def load_models_once():
+    global selector, ensemble
 
-
-@lru_cache(maxsize=1)
-def get_models():
-    selector_path = _pick_existing("selector_compressed.joblib", "selector.joblib")
-    ensemble_path = _pick_existing("ensemble_model_compressed.joblib", "ensemble_model.joblib")
-
-    selector = load(selector_path, mmap_mode="r")
-    ensemble = load(ensemble_path, mmap_mode="r")
+    logger.info("Loading models from disk...")
+    selector = load(SELECTOR_PATH)  # NO mmap
+    ensemble = load(ENSEMBLE_PATH)  # NO mmap
 
     log_memory("Models loaded")
-    return selector, ensemble
+    logger.info("Models loaded successfully.")
 
 
 # ---------------------------------------------------------
-# Health
+# Health Endpoint (NO model loading!)
 # ---------------------------------------------------------
 @app.get("/health")
 async def health():
-    try:
-        get_models()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True}
 
 
 # ---------------------------------------------------------
-# Prediction
+# Prediction logic
 # ---------------------------------------------------------
-def predict_from_bytes(data_bytes: bytes):
+def predict_from_bytes(data: bytes):
     tmp_path = None
+
     try:
         # Save temp .mat file
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
-            tmp.write(data_bytes)
+            tmp.write(data)
             tmp.flush()
             tmp_path = tmp.name
 
         log_memory("Temp file saved")
 
+        # Extract features
         feats = extract_features(tmp_path)
-        log_memory("Features extracted")
-
         if feats is None or getattr(feats, "ndim", 0) != 1:
             raise RuntimeError("Invalid features extracted")
 
         feats = np.asarray(feats, dtype=np.float32).reshape(1, -1)
 
-        selector, ensemble = get_models()
+        # Transform + Predict
         Xsel = selector.transform(feats)
         probs = ensemble.predict_proba(Xsel)[0]
 
@@ -137,6 +128,7 @@ def predict_from_bytes(data_bytes: bytes):
         }
 
     finally:
+        # Remove temp file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -148,15 +140,17 @@ def predict_from_bytes(data_bytes: bytes):
 
 
 # ---------------------------------------------------------
-# Predict endpoint
+# Predict Endpoint
 # ---------------------------------------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
         data = await file.read()
         return predict_from_bytes(data)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         gc.collect()
-        log_memory("Request cleanup complete")
+        log_memory("Request cleanup done")
