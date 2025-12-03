@@ -205,7 +205,20 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
     finally:
-        if contents is not None:
-            del contents
-        gc.collect()
-        log_memory("Request cleanup done")
+    # Safely delete temporary file
+    try:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception:
+        pass
+
+    # Delete local variables safely
+    for var in ["feats", "Xsel", "probs"]:
+        if var in locals():
+            try:
+                del locals()[var]
+            except:
+                pass
+
+    gc.collect()
+    log_memory("After cleanup")
