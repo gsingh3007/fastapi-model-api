@@ -212,7 +212,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception:
         pass
 
-    # Delete local variables safely
+    # Safely delete variables
     for var in ["feats", "Xsel", "probs"]:
         if var in locals():
             try:
