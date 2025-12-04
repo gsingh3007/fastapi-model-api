@@ -140,6 +140,10 @@ def predict_from_bytes(data: bytes):
 # ---------------------------------------------------------
 # Predict Endpoint
 # ---------------------------------------------------------
+@app.options("/predict")
+async def predict_options():
+    return {}
+    
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
