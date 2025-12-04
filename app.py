@@ -51,15 +51,12 @@ ensemble = None
 app = FastAPI(title="EEG Anxiety Detection API")
 
 origins = [
-    "http://localhost:9002",
-    "http://localhost:3000",
-    "https://anxiocheck-ypipu.web.app",
-    "https://anxiocheck-ypipu.firebaseapp.com",
+    "*",   # temporarily allow all until frontend domain fixed
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # temporarily allow all
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
