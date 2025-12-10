@@ -56,6 +56,7 @@ origins = [
     "https://api.anxiocheck.online",
     "https://anxiocheck.online",
     "https://www.anxiocheck.online",
+    "*",  # optional for testing only — remove later for security
 ]
 
 app.add_middleware(
