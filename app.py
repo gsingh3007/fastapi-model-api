@@ -51,9 +51,12 @@ ensemble = None
 app = FastAPI(title="EEG Anxiety Detection API")
 
 origins = [
+    "https://anxiocheck.web.app",
+    "https://anxiocheck.firebaseapp.com",
     "https://anxiocheck.online",
     "https://www.anxiocheck.online",
-    "*",   # keep temporarily until frontend is fully tested (remove later)
+    "https://api.anxiocheck.online",
+    "*"  # (optional during testing)
 ]
 
 app.add_middleware(
@@ -62,7 +65,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    max_age=86400
 )
 
 
