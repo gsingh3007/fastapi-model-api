@@ -153,40 +153,42 @@ def predict_modma_from_bytes(data: bytes):
 # ---------------------------------------------------------
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    tmp_path = None
-
     try:
-        filename = (file.filename or "").lower()
+        filename = file.filename.lower()
         data = await file.read()
 
         # -------------------------------
-        # MODMA → .mat
+        # DASPS → EDF (14-channel)
         # -------------------------------
-        if filename.endswith(".mat"):
+        if filename.endswith(".edf"):
+            tmp_path = None
+            try:
+                with NamedTemporaryFile(suffix=".edf", delete=False, dir=ROOT) as tmp:
+                    tmp.write(data)
+                    tmp.flush()
+                    tmp_path = tmp.name
+
+                return predict_dasps(tmp_path)
+
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        # -------------------------------
+        # MODMA → MAT (128-channel)
+        # -------------------------------
+        elif filename.endswith(".mat"):
             return predict_modma_from_bytes(data)
-
-        # -------------------------------
-        # DASPS → .edf
-        # -------------------------------
-        elif filename.endswith(".edf"):
-            with NamedTemporaryFile(suffix=".edf", delete=False, dir=ROOT) as tmp:
-                tmp.write(data)
-                tmp.flush()
-                tmp_path = tmp.name
-
-            return predict_dasps(tmp_path)
 
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported file type. Use .mat (MODMA) or .edf (DASPS)."
+                detail="Unsupported file type. Upload .mat (MODMA) or .edf (DASPS)."
             )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
         gc.collect()
         log_memory("Request cleanup done")
