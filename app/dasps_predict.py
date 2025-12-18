@@ -8,7 +8,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(APP_DIR)
 sys.path.append(PROJECT_ROOT)
 
-from app.dasps2 import preprocess_raw, extract_subject_features
+from app.dasps_runtime import preprocess_raw, extract_subject_features
 
 MODEL_DIR = os.path.join(APP_DIR, "models")
 
