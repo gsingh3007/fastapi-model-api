@@ -113,4 +113,20 @@ def extract_subject_features(raw):
 
             f, P = welch(ch, sfreq, nperseg=int(sfreq * 4))
             for lo, hi in FREQ_BANDS.values():
-                feat.append(np.me
+                feat.append(np.mean(P[(f >= lo) & (f <= hi)]))
+
+        for lo, hi in FREQ_BANDS.values():
+            filtered = bandpass_filter(ep, lo, hi, sfreq)
+            feat += pli_graph_features(filtered)
+
+        all_epoch_feats.append(feat)
+
+    all_epoch_feats = np.array(all_epoch_feats)
+
+    return np.concatenate(
+        [
+            np.mean(all_epoch_feats, axis=0),
+            np.median(all_epoch_feats, axis=0),
+            np.std(all_epoch_feats, axis=0),
+        ]
+    )
