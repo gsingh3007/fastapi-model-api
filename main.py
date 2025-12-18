@@ -1,28 +1,28 @@
 import os
 import gc
 import json
-import numpy as np
 import sys
+import logging
+import numpy as np
 from tempfile import NamedTemporaryFile
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
 import psutil
-import logging
 
 # ---------------------------------------------------------
 # PATH FIX (important for app/ structure)
 # ---------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(APP_DIR)
+PROJECT_ROOT = APP_DIR
 sys.path.append(PROJECT_ROOT)
 
 # ---------------------------------------------------------
 # IMPORTS
 # ---------------------------------------------------------
-from modma_runtime import extract_features           # MODMA
-from app.dasps_predict import predict_dasps          # DASPS
+from modma_runtime import extract_features           # MODMA (128-channel)
+from app.dasps_predict import predict_dasps          # DASPS (14-channel)
 
 # ---------------------------------------------------------
 # Logging
@@ -38,7 +38,7 @@ def log_memory(stage=""):
     try:
         mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
         logger.info(f"[MEMORY] {stage}: {mem:.2f} MB")
-    except:
+    except Exception:
         pass
 
 
@@ -69,7 +69,7 @@ origins = [
     "https://api.anxiocheck.online",
     "https://anxiocheck.online",
     "https://www.anxiocheck.online",
-    "*",  # ⚠ remove later
+    "*",  # ⚠ tighten later
 ]
 
 app.add_middleware(
@@ -105,7 +105,7 @@ async def health():
 
 
 # ---------------------------------------------------------
-# MODMA prediction logic (128-channel)
+# MODMA prediction logic (128-channel, .mat)
 # ---------------------------------------------------------
 def predict_modma_from_bytes(data: bytes):
     tmp_path = None
@@ -136,8 +136,8 @@ def predict_modma_from_bytes(data: bytes):
             "prediction": label,
             "confidence": round(float(probs[idx]) * 100, 2),
             "probabilities": {
-                labels.get("0", "0"): round(float(probs[0]) * 100, 2),
-                labels.get("1", "1"): round(float(probs[1]) * 100, 2),
+                labels.get("0", "not_anxious"): round(float(probs[0]) * 100, 2),
+                labels.get("1", "anxious"): round(float(probs[1]) * 100, 2),
             },
         }
 
@@ -149,53 +149,44 @@ def predict_modma_from_bytes(data: bytes):
 
 
 # ---------------------------------------------------------
-# Unified Predict Endpoint (14 + 128)
+# Unified Predict Endpoint (AUTO detect .mat / .edf)
 # ---------------------------------------------------------
-@app.options("/predict")
-async def predict_options():
-    return {}
-
-
 @app.post("/predict")
-async def predict(
-    channel_type: str = Form(...),   # "14" or "128"
-    file: UploadFile = File(...)
-):
+async def predict(file: UploadFile = File(...)):
+    tmp_path = None
+
     try:
+        filename = (file.filename or "").lower()
         data = await file.read()
 
         # -------------------------------
-        # MODMA (128-channel, .mat)
+        # MODMA → .mat
         # -------------------------------
-        if channel_type == "128":
+        if filename.endswith(".mat"):
             return predict_modma_from_bytes(data)
 
         # -------------------------------
-        # DASPS (14-channel, .edf)
+        # DASPS → .edf
         # -------------------------------
-        elif channel_type == "14":
-            tmp_path = None
-            try:
-                with NamedTemporaryFile(suffix=".edf", delete=False, dir=ROOT) as tmp:
-                    tmp.write(data)
-                    tmp.flush()
-                    tmp_path = tmp.name
+        elif filename.endswith(".edf"):
+            with NamedTemporaryFile(suffix=".edf", delete=False, dir=ROOT) as tmp:
+                tmp.write(data)
+                tmp.flush()
+                tmp_path = tmp.name
 
-                return predict_dasps(tmp_path)
-
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            return predict_dasps(tmp_path)
 
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Invalid channel_type. Use '14' or '128'."
+                detail="Unsupported file type. Use .mat (MODMA) or .edf (DASPS)."
             )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         gc.collect()
         log_memory("Request cleanup done")
