@@ -2,14 +2,27 @@ import os
 import gc
 import json
 import numpy as np
+import sys
 from tempfile import NamedTemporaryFile
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from joblib import load
-from modma_eeg import extract_features
 import psutil
 import logging
+
+# ---------------------------------------------------------
+# PATH FIX (important for app/ structure)
+# ---------------------------------------------------------
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(APP_DIR)
+sys.path.append(PROJECT_ROOT)
+
+# ---------------------------------------------------------
+# IMPORTS
+# ---------------------------------------------------------
+from modma_eeg import extract_features               # MODMA
+from app.dasps_predict import predict_dasps          # DASPS
 
 # ---------------------------------------------------------
 # Logging
@@ -30,7 +43,7 @@ def log_memory(stage=""):
 
 
 # ---------------------------------------------------------
-# Paths & Config
+# Paths & Config (MODMA)
 # ---------------------------------------------------------
 ROOT = os.path.dirname(__file__)
 MODEL_DIR = os.path.join(ROOT, "exported_model")
@@ -48,7 +61,7 @@ ensemble = None
 # ---------------------------------------------------------
 # FastAPI App + CORS
 # ---------------------------------------------------------
-app = FastAPI(title="EEG Anxiety Detection API")
+app = FastAPI(title="AnxioCheck EEG API")
 
 origins = [
     "https://anxiocheck-ypipu.web.app",
@@ -56,7 +69,7 @@ origins = [
     "https://api.anxiocheck.online",
     "https://anxiocheck.online",
     "https://www.anxiocheck.online",
-    "*",  # optional for testing only — remove later for security
+    "*",  # ⚠ remove later
 ]
 
 app.add_middleware(
@@ -69,22 +82,22 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-# Load Models ONCE at startup
+# Load MODMA models ONCE at startup
 # ---------------------------------------------------------
 @app.on_event("startup")
 def load_models_once():
     global selector, ensemble
 
-    logger.info("Loading models from disk...")
-    selector = load(SELECTOR_PATH)  # NO mmap
-    ensemble = load(ENSEMBLE_PATH)  # NO mmap
+    logger.info("Loading MODMA models from disk...")
+    selector = load(SELECTOR_PATH)
+    ensemble = load(ENSEMBLE_PATH)
 
-    log_memory("Models loaded")
-    logger.info("Models loaded successfully.")
+    log_memory("MODMA models loaded")
+    logger.info("MODMA models ready.")
 
 
 # ---------------------------------------------------------
-# Health Endpoint (NO model loading!)
+# Health Endpoint
 # ---------------------------------------------------------
 @app.get("/health")
 async def health():
@@ -92,28 +105,25 @@ async def health():
 
 
 # ---------------------------------------------------------
-# Prediction logic
+# MODMA prediction logic (128-channel)
 # ---------------------------------------------------------
-def predict_from_bytes(data: bytes):
+def predict_modma_from_bytes(data: bytes):
     tmp_path = None
 
     try:
-        # Save temp .mat file
         with NamedTemporaryFile(suffix=".mat", delete=False, dir=ROOT) as tmp:
             tmp.write(data)
             tmp.flush()
             tmp_path = tmp.name
 
-        log_memory("Temp file saved")
+        log_memory("MODMA temp file saved")
 
-        # Extract features
         feats = extract_features(tmp_path)
         if feats is None or getattr(feats, "ndim", 0) != 1:
-            raise RuntimeError("Invalid features extracted")
+            raise RuntimeError("Invalid MODMA features")
 
         feats = np.asarray(feats, dtype=np.float32).reshape(1, -1)
 
-        # Transform + Predict
         Xsel = selector.transform(feats)
         probs = ensemble.predict_proba(Xsel)[0]
 
@@ -122,7 +132,8 @@ def predict_from_bytes(data: bytes):
         label = labels.get(str(idx), str(idx))
 
         return {
-            "label": label,
+            "model": "MODMA_128_Ensemble_v1",
+            "prediction": label,
             "confidence": round(float(probs[idx]) * 100, 2),
             "probabilities": {
                 labels.get("0", "0"): round(float(probs[0]) * 100, 2),
@@ -131,29 +142,56 @@ def predict_from_bytes(data: bytes):
         }
 
     finally:
-        # Remove temp file
         if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except:
-                pass
-
+            os.remove(tmp_path)
         gc.collect()
-        log_memory("Cleanup complete")
+        log_memory("MODMA cleanup complete")
 
 
 # ---------------------------------------------------------
-# Predict Endpoint
+# Unified Predict Endpoint (14 + 128)
 # ---------------------------------------------------------
 @app.options("/predict")
 async def predict_options():
     return {}
-    
+
+
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    channel_type: str = Form(...),   # "14" or "128"
+    file: UploadFile = File(...)
+):
     try:
         data = await file.read()
-        return predict_from_bytes(data)
+
+        # -------------------------------
+        # MODMA (128-channel, .mat)
+        # -------------------------------
+        if channel_type == "128":
+            return predict_modma_from_bytes(data)
+
+        # -------------------------------
+        # DASPS (14-channel, .edf)
+        # -------------------------------
+        elif channel_type == "14":
+            tmp_path = None
+            try:
+                with NamedTemporaryFile(suffix=".edf", delete=False, dir=ROOT) as tmp:
+                    tmp.write(data)
+                    tmp.flush()
+                    tmp_path = tmp.name
+
+                return predict_dasps(tmp_path)
+
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid channel_type. Use '14' or '128'."
+            )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
