@@ -21,7 +21,7 @@ sys.path.append(PROJECT_ROOT)
 # ---------------------------------------------------------
 # IMPORTS
 # ---------------------------------------------------------
-from modma_eeg import extract_features               # MODMA
+from modma_runtime import extract_features           # MODMA
 from app.dasps_predict import predict_dasps          # DASPS
 
 # ---------------------------------------------------------
